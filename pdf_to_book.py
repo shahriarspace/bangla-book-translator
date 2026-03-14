@@ -938,6 +938,177 @@ date: "{time.strftime("%Y-%m-%d")}"
 
 
 # ---------------------------------------------------------------------------
+# JSON export (bangla-library format)
+# ---------------------------------------------------------------------------
+
+
+def _parse_translation_md(md_path: Path) -> tuple[list[str], list[str]]:
+    """Parse a translation .md file into Bengali and English paragraph lists.
+
+    Expected format:
+        ## Original (Bengali)
+
+        <paragraphs separated by blank lines>
+
+        ---
+
+        ## Translation (English)
+
+        <paragraphs separated by blank lines>
+
+    Returns (bengali_paragraphs, english_paragraphs).
+    """
+    text = md_path.read_text(encoding="utf-8").strip()
+
+    # Skip pages with no translatable text
+    if "No translatable text" in text:
+        return [], []
+
+    # Split into Bengali and English sections
+    # Look for the --- separator between sections
+    bn_paragraphs: list[str] = []
+    en_paragraphs: list[str] = []
+
+    # Find the Bengali section
+    bn_start = text.find("## Original (Bengali)")
+    en_start = text.find("## Translation (English)")
+
+    if bn_start == -1 or en_start == -1:
+        # Fallback: try to find just the separator
+        log.warning(f"  Non-standard format in {md_path.name}, skipping")
+        return [], []
+
+    # Extract Bengali text: between "## Original (Bengali)" header and "---"
+    bn_section = text[bn_start:en_start]
+    # Remove the header line
+    bn_section = bn_section.replace("## Original (Bengali)", "").strip()
+    # Remove trailing --- separator
+    bn_section = bn_section.rstrip("-").strip()
+
+    # Extract English text: after "## Translation (English)" header
+    en_section = text[en_start:]
+    en_section = en_section.replace("## Translation (English)", "").strip()
+    # Remove trailing --- if present
+    en_section = en_section.rstrip("-").strip()
+
+    # Split into paragraphs by blank lines
+    bn_paragraphs = [p.strip() for p in re.split(r"\n\s*\n", bn_section) if p.strip()]
+    en_paragraphs = [p.strip() for p in re.split(r"\n\s*\n", en_section) if p.strip()]
+
+    # The AI sometimes formats Bengali text without blank lines between paragraphs
+    # (each paragraph is just a single newline away). If blank-line splitting produces
+    # far fewer Bengali paragraphs than English, fall back to single-newline splitting.
+    if (
+        bn_paragraphs
+        and en_paragraphs
+        and len(bn_paragraphs) < len(en_paragraphs) * 0.5
+    ):
+        bn_paragraphs = [p.strip() for p in bn_section.split("\n") if p.strip()]
+
+    return bn_paragraphs, en_paragraphs
+
+
+def export_to_json(
+    translation_paths: list[Path],
+    output_dir: str,
+    title_en: str,
+    title_bn: str = "",
+    author_en: str = "",
+    author_bn: str = "",
+    year: str = "",
+    category: str = "Novel",
+    description_en: str = "",
+    slug: str | None = None,
+) -> Path:
+    """Convert translation .md files to bangla-library JSON format.
+
+    Reads all translation files, extracts Bengali/English paragraph pairs,
+    and writes a single JSON file compatible with the bangla-library Astro site.
+    """
+    all_bn: list[str] = []
+    all_en: list[str] = []
+
+    for md_path in translation_paths:
+        bn_paras, en_paras = _parse_translation_md(md_path)
+
+        if not bn_paras and not en_paras:
+            continue
+
+        # If paragraph counts don't match, log a warning but still include them.
+        # Pair up as many as we can, then append any extras as unpaired.
+        if len(bn_paras) != len(en_paras):
+            log.warning(
+                f"  Paragraph mismatch in {md_path.name}: "
+                f"{len(bn_paras)} bn vs {len(en_paras)} en"
+            )
+
+        all_bn.extend(bn_paras)
+        all_en.extend(en_paras)
+
+    # Build the paragraphs array with paired bn/en
+    # Use the shorter list length for paired entries, then append extras
+    paired_count = min(len(all_bn), len(all_en))
+    paragraphs = []
+
+    for i in range(paired_count):
+        paragraphs.append(
+            {
+                "id": i + 1,
+                "bn": all_bn[i],
+                "en": all_en[i],
+            }
+        )
+
+    # Append any remaining unpaired paragraphs
+    for i in range(paired_count, len(all_bn)):
+        paragraphs.append(
+            {
+                "id": len(paragraphs) + 1,
+                "bn": all_bn[i],
+                "en": "(translation not available)",
+            }
+        )
+    for i in range(paired_count, len(all_en)):
+        paragraphs.append(
+            {
+                "id": len(paragraphs) + 1,
+                "bn": "(মূল পাঠ্য পাওয়া যায়নি)",
+                "en": all_en[i],
+            }
+        )
+
+    # Build the book JSON object
+    book_data: dict = {
+        "title_bn": title_bn,
+        "title_en": title_en,
+        "author_bn": author_bn,
+        "author_en": author_en,
+        "year": year,
+        "category": category,
+    }
+    if description_en:
+        book_data["description_en"] = description_en
+    book_data["paragraphs"] = paragraphs
+
+    # Determine output filename
+    if not slug:
+        slug = title_en.lower().replace(" ", "-")
+        # Clean slug: keep only alphanumeric and hyphens
+        slug = re.sub(r"[^a-z0-9-]", "", slug)
+        slug = re.sub(r"-+", "-", slug).strip("-")
+
+    json_path = Path(output_dir) / f"{slug}.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(book_data, f, ensure_ascii=False, indent=2)
+
+    log.info(f"Exported {len(paragraphs)} paragraphs to {json_path}")
+    log.info(
+        f"  Bengali: {len(all_bn)} | English: {len(all_en)} | Paired: {paired_count}"
+    )
+    return json_path
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1169,6 +1340,31 @@ Examples:
         default=[],
         help="Page numbers to skip",
     )
+    run_parser.add_argument(
+        "--export-json",
+        action="store_true",
+        help="Also export to bangla-library JSON format after combining",
+    )
+    run_parser.add_argument(
+        "--title-bn", default="", help="Bengali title (for JSON export)"
+    )
+    run_parser.add_argument(
+        "--author-bn", default="", help="Author name in Bengali (for JSON export)"
+    )
+    run_parser.add_argument(
+        "--year", default="", help="Publication year (for JSON export)"
+    )
+    run_parser.add_argument(
+        "--category", default="Novel", help="Category (for JSON export, default: Novel)"
+    )
+    run_parser.add_argument(
+        "--description", default="", help="English description (for JSON export)"
+    )
+    run_parser.add_argument(
+        "--json-dest",
+        default=None,
+        help="Destination dir for JSON file (default: output dir)",
+    )
     _add_common_args(run_parser)
 
     # --- extract: PDF to images only ---
@@ -1232,6 +1428,51 @@ Examples:
     )
     combine_parser.add_argument("--title", "-t", required=True, help="Book title")
     combine_parser.add_argument("--author", "-a", required=True, help="Book author")
+    combine_parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        default=False,
+        help="Enable verbose/debug logging",
+    )
+
+    # --- export-json: export to bangla-library format ---
+    export_parser = subparsers.add_parser(
+        "export-json",
+        help="Export translations to bangla-library JSON format",
+    )
+    export_parser.add_argument(
+        "--output",
+        "-o",
+        default="output",
+        help="Output directory (must contain translations/)",
+    )
+    export_parser.add_argument("--title-en", required=True, help="English title")
+    export_parser.add_argument("--title-bn", default="", help="Bengali title")
+    export_parser.add_argument("--author-en", default="", help="Author name (English)")
+    export_parser.add_argument("--author-bn", default="", help="Author name (Bengali)")
+    export_parser.add_argument("--year", default="", help="Publication year")
+    export_parser.add_argument(
+        "--category", default="Novel", help="Category (default: Novel)"
+    )
+    export_parser.add_argument("--description", default="", help="English description")
+    export_parser.add_argument(
+        "--slug",
+        default=None,
+        help="Output filename slug (default: derived from title)",
+    )
+    export_parser.add_argument(
+        "--dest",
+        default=None,
+        help="Destination directory for JSON file (default: same as --output)",
+    )
+    export_parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        default=False,
+        help="Enable verbose/debug logging",
+    )
 
     args = parser.parse_args()
 
@@ -1435,11 +1676,32 @@ Examples:
             author=author,
         )
 
+        # Optional: JSON export for bangla-library
+        json_path = None
+        if args.export_json:
+            log.info("")
+            log.info(">>> BONUS STEP: Exporting to bangla-library JSON")
+            log.info("-" * 40)
+            json_dest = args.json_dest or output_dir
+            json_path = export_to_json(
+                translation_paths,
+                json_dest,
+                title_en=title,
+                title_bn=args.title_bn,
+                author_en=author,
+                author_bn=args.author_bn,
+                year=args.year,
+                category=args.category,
+                description_en=args.description,
+            )
+
         total_time = time.time() - pipeline_start
         log.info("")
         log.info("=" * 60)
         log.info(f"  PIPELINE COMPLETE")
         log.info(f"  Book:     {book_path}")
+        if json_path:
+            log.info(f"  JSON:     {json_path}")
         log.info(f"  Pages:    {len(images)}")
         log.info(f"  Duration: {_format_duration(total_time)}")
         log.info(f"  Finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -1529,6 +1791,34 @@ Examples:
             sys.exit(1)
 
         combine_translations(md_files, args.output, args.title, args.author)
+
+    # ---- EXPORT JSON ----
+    elif args.command == "export-json":
+        log = setup_logging(verbose=args.verbose)
+        translations_dir = Path(args.output) / "translations"
+        if not translations_dir.exists():
+            log.error(f"Translations directory not found: {translations_dir}")
+            log.error("Run the pipeline or 'translate' first.")
+            sys.exit(1)
+
+        md_files = sorted(translations_dir.glob("page_*.md"))
+        if not md_files:
+            log.error(f"No translation files found in {translations_dir}")
+            sys.exit(1)
+
+        dest_dir = args.dest or args.output
+        export_to_json(
+            md_files,
+            dest_dir,
+            title_en=args.title_en,
+            title_bn=args.title_bn,
+            author_en=args.author_en,
+            author_bn=args.author_bn,
+            year=args.year,
+            category=args.category,
+            description_en=args.description,
+            slug=args.slug,
+        )
 
 
 if __name__ == "__main__":
