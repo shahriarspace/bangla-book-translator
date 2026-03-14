@@ -1,0 +1,26 @@
+# Input PDFs
+*.pdf
+
+# Output directory (images, OCR, translations, combined book)
+output/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# User-specific config (template is committed as config.example.json)
+config.json
+
+# Temp / debug artifacts
+nul
+stderr.txt
+*.png
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

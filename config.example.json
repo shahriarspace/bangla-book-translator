@@ -1,0 +1,17 @@
+{
+  "book_title": "Your Book Title",
+  "author": "Author Name",
+  "source_language": "Bengali",
+  "target_language": "English",
+  "pdf_path": "Your-Book-By-Author.pdf",
+  "output_dir": "output/your-book",
+  "image_dpi": 300,
+  "image_format": "png",
+  "start_page": 1,
+  "end_page": null,
+  "skip_pages": [],
+  "ocr_model": "github-copilot/gpt-4o",
+  "translate_model": "github-copilot/claude-sonnet-4",
+  "delay_between_pages": 2,
+  "max_retries": 3
+}
