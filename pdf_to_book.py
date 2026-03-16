@@ -1019,11 +1019,32 @@ def export_to_json(
     category: str = "Novel",
     description_en: str = "",
     slug: str | None = None,
+    # --- bangla-library extended fields ---
+    author_slug: str = "",
+    status: str = "published",
+    published_date: str = "",
+    description_bn: str = "",
+    copyright_notice: str = "",
+    source: str = "",
+    original_publisher: str = "",
+    edition_note: str = "",
+    translation_reviewed: bool = False,
 ) -> Path:
     """Convert translation .md files to bangla-library JSON format.
 
     Reads all translation files, extracts Bengali/English paragraph pairs,
     and writes a single JSON file compatible with the bangla-library Astro site.
+
+    Extended fields (all optional in the schema):
+      author_slug        - Links to author profile page (e.g. "rabindranath-tagore")
+      status             - "published" or "unpublished" (default: "published")
+      published_date     - ISO date when book was added (e.g. "2025-06-15")
+      description_bn     - Bengali description
+      copyright_notice   - For non-public-domain works
+      source             - URL or reference to original PDF source
+      original_publisher - Original publisher name
+      edition_note       - Notes about the edition used
+      translation_reviewed - Whether a human reviewed the translation (default: False)
     """
     all_bn: list[str] = []
     all_en: list[str] = []
@@ -1086,8 +1107,28 @@ def export_to_json(
         "year": year,
         "category": category,
     }
+    # Optional fields — only include if non-empty to keep JSON clean
+    if author_slug:
+        book_data["author_slug"] = author_slug
+    if status and status != "published":
+        # Schema defaults to "published", so only emit if different
+        book_data["status"] = status
+    if published_date:
+        book_data["published_date"] = published_date
     if description_en:
         book_data["description_en"] = description_en
+    if description_bn:
+        book_data["description_bn"] = description_bn
+    if copyright_notice:
+        book_data["copyright_notice"] = copyright_notice
+    if source:
+        book_data["source"] = source
+    if original_publisher:
+        book_data["original_publisher"] = original_publisher
+    if edition_note:
+        book_data["edition_note"] = edition_note
+    if translation_reviewed:
+        book_data["translation_reviewed"] = True
     book_data["paragraphs"] = paragraphs
 
     # Determine output filename
@@ -1365,6 +1406,44 @@ Examples:
         default=None,
         help="Destination dir for JSON file (default: output dir)",
     )
+    # --- bangla-library extended fields (for JSON export) ---
+    run_parser.add_argument(
+        "--author-slug",
+        default="",
+        help="Author slug for profile link (e.g. 'rabindranath-tagore')",
+    )
+    run_parser.add_argument(
+        "--status",
+        default="published",
+        choices=["published", "unpublished"],
+        help="Publication status (default: published)",
+    )
+    run_parser.add_argument(
+        "--published-date",
+        default="",
+        help="ISO date when book was added (e.g. '2025-06-15'). Defaults to today.",
+    )
+    run_parser.add_argument(
+        "--description-bn", default="", help="Bengali description (for JSON export)"
+    )
+    run_parser.add_argument(
+        "--copyright-notice", default="", help="Copyright notice (for JSON export)"
+    )
+    run_parser.add_argument(
+        "--source", default="", help="URL or reference to original PDF source"
+    )
+    run_parser.add_argument(
+        "--original-publisher", default="", help="Original publisher name"
+    )
+    run_parser.add_argument(
+        "--edition-note", default="", help="Notes about the edition used"
+    )
+    run_parser.add_argument(
+        "--translation-reviewed",
+        action="store_true",
+        default=False,
+        help="Mark translation as human-reviewed (default: False)",
+    )
     _add_common_args(run_parser)
 
     # --- extract: PDF to images only ---
@@ -1465,6 +1544,46 @@ Examples:
         "--dest",
         default=None,
         help="Destination directory for JSON file (default: same as --output)",
+    )
+    # --- bangla-library extended fields ---
+    export_parser.add_argument(
+        "--author-slug",
+        default="",
+        help="Author slug for profile link (e.g. 'rabindranath-tagore')",
+    )
+    export_parser.add_argument(
+        "--status",
+        default="published",
+        choices=["published", "unpublished"],
+        help="Publication status (default: published)",
+    )
+    export_parser.add_argument(
+        "--published-date",
+        default="",
+        help="ISO date when book was added (e.g. '2025-06-15'). Defaults to today.",
+    )
+    export_parser.add_argument(
+        "--description-bn", default="", help="Bengali description"
+    )
+    export_parser.add_argument(
+        "--copyright-notice",
+        default="",
+        help="Copyright notice for non-public-domain works",
+    )
+    export_parser.add_argument(
+        "--source", default="", help="URL or reference to original PDF source"
+    )
+    export_parser.add_argument(
+        "--original-publisher", default="", help="Original publisher name"
+    )
+    export_parser.add_argument(
+        "--edition-note", default="", help="Notes about the edition used"
+    )
+    export_parser.add_argument(
+        "--translation-reviewed",
+        action="store_true",
+        default=False,
+        help="Mark translation as human-reviewed (default: False)",
     )
     export_parser.add_argument(
         "--verbose",
@@ -1683,16 +1802,54 @@ Examples:
             log.info(">>> BONUS STEP: Exporting to bangla-library JSON")
             log.info("-" * 40)
             json_dest = args.json_dest or output_dir
+
+            # Resolve JSON export fields: CLI args > config file > defaults
+            j_title_bn = args.title_bn or config.get("title_bn", "")
+            j_author_bn = args.author_bn or config.get("author_bn", "")
+            j_year = args.year or config.get("year", "")
+            j_category = args.category or config.get("category", "Novel")
+            j_description = args.description or config.get("description_en", "")
+            j_author_slug = args.author_slug or config.get("author_slug", "")
+            j_status = (
+                args.status
+                if args.status != "published"
+                else config.get("status", "published")
+            )
+            j_published_date = args.published_date or config.get("published_date", "")
+            j_description_bn = args.description_bn or config.get("description_bn", "")
+            j_copyright = args.copyright_notice or config.get("copyright_notice", "")
+            j_source = args.source or config.get("source", "")
+            j_publisher = args.original_publisher or config.get(
+                "original_publisher", ""
+            )
+            j_edition = args.edition_note or config.get("edition_note", "")
+            j_reviewed = args.translation_reviewed or config.get(
+                "translation_reviewed", False
+            )
+
+            # Auto-fill published_date with today if not provided
+            if not j_published_date:
+                j_published_date = datetime.now().strftime("%Y-%m-%d")
+
             json_path = export_to_json(
                 translation_paths,
                 json_dest,
                 title_en=title,
-                title_bn=args.title_bn,
+                title_bn=j_title_bn,
                 author_en=author,
-                author_bn=args.author_bn,
-                year=args.year,
-                category=args.category,
-                description_en=args.description,
+                author_bn=j_author_bn,
+                year=j_year,
+                category=j_category,
+                description_en=j_description,
+                author_slug=j_author_slug,
+                status=j_status,
+                published_date=j_published_date,
+                description_bn=j_description_bn,
+                copyright_notice=j_copyright,
+                source=j_source,
+                original_publisher=j_publisher,
+                edition_note=j_edition,
+                translation_reviewed=j_reviewed,
             )
 
         total_time = time.time() - pipeline_start
@@ -1807,6 +1964,12 @@ Examples:
             sys.exit(1)
 
         dest_dir = args.dest or args.output
+
+        # Auto-fill published_date with today if not provided
+        pub_date = args.published_date
+        if not pub_date:
+            pub_date = datetime.now().strftime("%Y-%m-%d")
+
         export_to_json(
             md_files,
             dest_dir,
@@ -1818,6 +1981,15 @@ Examples:
             category=args.category,
             description_en=args.description,
             slug=args.slug,
+            author_slug=args.author_slug,
+            status=args.status,
+            published_date=pub_date,
+            description_bn=args.description_bn,
+            copyright_notice=args.copyright_notice,
+            source=args.source,
+            original_publisher=args.original_publisher,
+            edition_note=args.edition_note,
+            translation_reviewed=args.translation_reviewed,
         )
 
 
