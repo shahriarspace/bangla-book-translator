@@ -1908,6 +1908,10 @@ def export_to_json(
     original_publisher: str = "",
     edition_note: str = "",
     translation_reviewed: bool = False,
+    cover_image: str = "",
+    back_image: str = "",
+    priority: int = 2,
+    publish_date: str = "",
 ) -> Path:
     """Convert translation .md files to bangla-library JSON format.
 
@@ -1924,6 +1928,10 @@ def export_to_json(
       original_publisher - Original publisher name
       edition_note       - Notes about the edition used
       translation_reviewed - Whether a human reviewed the translation (default: False)
+      cover_image        - Path/URL for cover image
+      back_image         - Path/URL for back cover image
+      priority           - Sort priority (lower = first, default: 2)
+      publish_date       - Scheduled publish date (ISO format)
     """
     all_bn: list[str] = []
     all_en: list[str] = []
@@ -2008,6 +2016,15 @@ def export_to_json(
         book_data["edition_note"] = edition_note
     if translation_reviewed:
         book_data["translation_reviewed"] = True
+    if cover_image:
+        book_data["cover_image"] = cover_image
+    if back_image:
+        book_data["back_image"] = back_image
+    if priority != 2:
+        # Schema defaults to 2, so only emit if different
+        book_data["priority"] = priority
+    if publish_date:
+        book_data["publish_date"] = publish_date
     book_data["paragraphs"] = paragraphs
 
     # Determine output filename
@@ -2329,6 +2346,27 @@ Examples:
         default=False,
         help="Mark translation as human-reviewed (default: False)",
     )
+    run_parser.add_argument(
+        "--cover-image",
+        default="",
+        help="Path/URL for cover image (e.g. '/bangla-library/covers/slug.jpg')",
+    )
+    run_parser.add_argument(
+        "--back-image",
+        default="",
+        help="Path/URL for back cover image",
+    )
+    run_parser.add_argument(
+        "--priority",
+        type=int,
+        default=2,
+        help="Sort priority — lower values appear first (default: 2)",
+    )
+    run_parser.add_argument(
+        "--publish-date",
+        default="",
+        help="Scheduled publish date in ISO format (e.g. '2025-07-01')",
+    )
     _add_common_args(run_parser)
     run_parser.add_argument(
         "--refine",
@@ -2510,6 +2548,27 @@ Examples:
         action="store_true",
         default=False,
         help="Mark translation as human-reviewed (default: False)",
+    )
+    export_parser.add_argument(
+        "--cover-image",
+        default="",
+        help="Path/URL for cover image (e.g. '/bangla-library/covers/slug.jpg')",
+    )
+    export_parser.add_argument(
+        "--back-image",
+        default="",
+        help="Path/URL for back cover image",
+    )
+    export_parser.add_argument(
+        "--priority",
+        type=int,
+        default=2,
+        help="Sort priority — lower values appear first (default: 2)",
+    )
+    export_parser.add_argument(
+        "--publish-date",
+        default="",
+        help="Scheduled publish date in ISO format (e.g. '2025-07-01')",
     )
     export_parser.add_argument(
         "--verbose",
@@ -2877,6 +2936,12 @@ Examples:
             j_reviewed = args.translation_reviewed or config.get(
                 "translation_reviewed", False
             )
+            j_cover_image = args.cover_image or config.get("cover_image", "")
+            j_back_image = args.back_image or config.get("back_image", "")
+            j_priority = (
+                args.priority if args.priority != 2 else config.get("priority", 2)
+            )
+            j_publish_date = args.publish_date or config.get("publish_date", "")
 
             # Auto-fill published_date with today if not provided
             if not j_published_date:
@@ -2901,6 +2966,10 @@ Examples:
                 original_publisher=j_publisher,
                 edition_note=j_edition,
                 translation_reviewed=j_reviewed,
+                cover_image=j_cover_image,
+                back_image=j_back_image,
+                priority=j_priority,
+                publish_date=j_publish_date,
             )
 
         total_time = time.time() - pipeline_start
@@ -3151,6 +3220,10 @@ Examples:
             original_publisher=args.original_publisher,
             edition_note=args.edition_note,
             translation_reviewed=args.translation_reviewed,
+            cover_image=args.cover_image,
+            back_image=args.back_image,
+            priority=args.priority,
+            publish_date=args.publish_date,
         )
 
 
