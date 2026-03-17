@@ -10,6 +10,7 @@ Supports two backends:
 """
 
 import argparse
+import difflib
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -894,8 +896,805 @@ def _clean_model_output(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Combine into a single book
+# Refinement Step 1: Unicode text normalization (FREE — no API calls)
 # ---------------------------------------------------------------------------
+
+
+# Zero-width and invisible Unicode characters to strip
+_INVISIBLE_CHARS = re.compile(
+    "[\u200b\u200c\u200d\u200e\u200f"  # zero-width space/joiners/marks
+    "\u00ad"  # soft hyphen
+    "\ufeff"  # BOM / zero-width no-break space
+    "\u2060"  # word joiner
+    "\u2061\u2062\u2063\u2064"  # invisible operators
+    "\u180e"  # mongolian vowel separator (sometimes appears)
+    "]"
+)
+
+
+def normalize_text(text: str) -> str:
+    """Apply Unicode NFC normalization and whitespace cleanup to text.
+
+    Operations:
+    1. NFC normalization (canonical decomposition + canonical composition)
+       — ensures Bengali conjuncts and diacritics are in canonical form
+    2. Strip zero-width and invisible characters
+    3. Collapse multiple spaces into one
+    4. Normalize line endings to \\n
+    5. Collapse 3+ consecutive blank lines into 2
+    6. Strip trailing whitespace from each line
+    """
+    if not text:
+        return text
+
+    # 1. NFC normalization
+    text = unicodedata.normalize("NFC", text)
+
+    # 2. Strip invisible/zero-width characters
+    text = _INVISIBLE_CHARS.sub("", text)
+
+    # 3. Normalize line endings
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # 4. Process line by line: strip trailing whitespace, collapse spaces
+    lines = []
+    for line in text.split("\n"):
+        # Collapse multiple spaces (but not leading indentation)
+        line = re.sub(r"  +", " ", line)
+        # Strip trailing whitespace
+        line = line.rstrip()
+        lines.append(line)
+
+    text = "\n".join(lines)
+
+    # 5. Collapse 3+ consecutive blank lines into 2
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text.strip()
+
+
+def normalize_ocr_files(output_dir: str) -> int:
+    """Apply normalize_text() to all OCR .txt files in output_dir/ocr/.
+
+    Modifies files in place. Returns the count of files normalized.
+    """
+    ocr_dir = Path(output_dir) / "ocr"
+    if not ocr_dir.exists():
+        log.warning(f"OCR directory not found: {ocr_dir}")
+        return 0
+
+    count = 0
+    for txt_path in sorted(ocr_dir.glob("page_*.txt")):
+        original = txt_path.read_text(encoding="utf-8")
+        normalized = normalize_text(original)
+        if normalized != original:
+            txt_path.write_text(normalized + "\n", encoding="utf-8")
+            count += 1
+
+    log.info(
+        f"Normalized {count} OCR files (of {len(list(ocr_dir.glob('page_*.txt')))} total)"
+    )
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Refinement Step 2: AI-based OCR error correction (costs API calls)
+# ---------------------------------------------------------------------------
+
+_OCR_CORRECTION_PROMPT = (
+    "You are an expert Bengali (Bangla) language proofreader specializing in OCR error correction. "
+    "Below is Bengali text extracted via OCR from a scanned book page. "
+    "It likely contains OCR errors such as:\n"
+    "- Character substitution (similar-looking Bengali characters swapped)\n"
+    "- Broken words (spaces inserted in the middle of words)\n"
+    "- Merged words (missing spaces between words)\n"
+    "- Diacritics/vowel mark errors (hasanta, matra placement)\n"
+    "- Line breaks in the middle of sentences\n\n"
+    "Fix all OCR errors while preserving the original meaning and paragraph structure. "
+    "Output ONLY the corrected Bengali text — no commentary, no explanation, no translation.\n\n"
+    "--- BEGIN OCR TEXT ---\n"
+    "{text}\n"
+    "--- END OCR TEXT ---"
+)
+
+
+def correct_ocr_page(
+    text: str,
+    backend: str = DEFAULT_BACKEND,
+    model: str | None = None,
+    max_retries: int = 3,
+    # Backend-specific
+    opencode_cli: str | None = None,
+    attach_url: str | None = None,
+    gh_cli: str | None = None,
+) -> str:
+    """Send Bengali OCR text for AI-based error correction. Returns corrected text."""
+    if not text.strip() or "NO_TEXT_CONTENT" in text or "OCR FAILED" in text:
+        return text
+
+    prompt = _OCR_CORRECTION_PROMPT.format(text=text)
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            t0 = time.time()
+            rc, stdout, stderr = _run_ai(
+                backend,
+                prompt,
+                model=model,
+                image_path=None,
+                timeout=180,
+                opencode_cli=opencode_cli,
+                attach_url=attach_url,
+                gh_cli=gh_cli,
+            )
+            elapsed = time.time() - t0
+
+            if rc == 0 and stdout:
+                corrected = _clean_model_output(stdout)
+                log.debug(
+                    f"    OCR correction OK in {elapsed:.1f}s ({len(corrected)} chars)"
+                )
+                return corrected
+            else:
+                log.warning(
+                    f"    OCR correction attempt {attempt}/{max_retries} FAILED ({elapsed:.1f}s): "
+                    f"{stderr[:200] or 'empty output'}"
+                )
+        except subprocess.TimeoutExpired:
+            log.warning(f"    OCR correction attempt {attempt}/{max_retries} TIMED OUT")
+        except FileNotFoundError as e:
+            log.error(f"CLI not found: {e}")
+            sys.exit(1)
+
+        if attempt < max_retries:
+            wait = attempt * 5
+            log.info(f"    Retrying in {wait}s...")
+            time.sleep(wait)
+
+    log.warning("    OCR correction failed, using original text")
+    return text
+
+
+def correct_ocr_all_pages(
+    output_dir: str,
+    backend: str = DEFAULT_BACKEND,
+    model: str | None = None,
+    delay: float = 2,
+    max_retries: int = 3,
+    # Backend-specific
+    opencode_cli: str | None = None,
+    attach_url: str | None = None,
+    gh_cli: str | None = None,
+) -> list[Path]:
+    """Run AI-based OCR correction on all pages. Saves to ocr_corrected/ directory.
+
+    Supports resume (skips pages with existing corrected output).
+    Returns sorted list of corrected file paths.
+    """
+    ocr_dir = Path(output_dir) / "ocr"
+    corrected_dir = Path(output_dir) / "ocr_corrected"
+    corrected_dir.mkdir(parents=True, exist_ok=True)
+
+    if not ocr_dir.exists():
+        log.error(f"OCR directory not found: {ocr_dir}")
+        return []
+
+    txt_files = sorted(ocr_dir.glob("page_*.txt"))
+    total = len(txt_files)
+    generated: list[Path] = []
+    skipped = 0
+    phase_start = time.time()
+
+    log.info(f"OCR correction pass: {total} pages (model: {model})")
+
+    for i, txt_path in enumerate(txt_files, 1):
+        corrected_path = corrected_dir / txt_path.name
+
+        # Resume support
+        if corrected_path.exists() and corrected_path.stat().st_size > 0:
+            skipped += 1
+            generated.append(corrected_path)
+            elapsed = time.time() - phase_start
+            log.info(
+                _progress_bar(
+                    i, total, elapsed=elapsed, label=f"{txt_path.name} SKIP (cached)"
+                )
+            )
+            continue
+
+        text = txt_path.read_text(encoding="utf-8").strip()
+
+        if not text or "NO_TEXT_CONTENT" in text or "OCR FAILED" in text:
+            corrected_path.write_text(text + "\n", encoding="utf-8")
+            generated.append(corrected_path)
+            elapsed = time.time() - phase_start
+            log.info(
+                _progress_bar(
+                    i, total, elapsed=elapsed, label=f"{txt_path.name} SKIP (no text)"
+                )
+            )
+            continue
+
+        elapsed = time.time() - phase_start
+        log.info(
+            _progress_bar(
+                i - 1, total, elapsed=elapsed, label=f"{txt_path.name} correcting..."
+            )
+        )
+
+        corrected = correct_ocr_page(
+            text,
+            backend=backend,
+            model=model,
+            max_retries=max_retries,
+            opencode_cli=opencode_cli,
+            attach_url=attach_url,
+            gh_cli=gh_cli,
+        )
+
+        # Normalize the corrected output too
+        corrected = normalize_text(corrected)
+        corrected_path.write_text(corrected + "\n", encoding="utf-8")
+        generated.append(corrected_path)
+
+        if i < total:
+            time.sleep(delay)
+
+    total_time = time.time() - phase_start
+    log.info(f"")
+    log.info(
+        f"OCR CORRECTION COMPLETE: {total} pages in {_format_duration(total_time)}"
+    )
+    log.info(f"  Processed: {total - skipped} | Skipped: {skipped}")
+    log.info(f"  Output: {corrected_dir}")
+    return sorted(generated)
+
+
+# ---------------------------------------------------------------------------
+# Refinement Step 3: Post-translation AI refinement (costs API calls)
+# ---------------------------------------------------------------------------
+
+_REFINEMENT_PROMPT = (
+    "You are an expert Bengali-to-English literary translation reviewer. "
+    "Below is a Bengali original text and its English translation from a novel. "
+    "Review both carefully and:\n"
+    "1. Fix any remaining OCR errors in the Bengali text\n"
+    "2. Improve the English translation for accuracy, fluency, and literary quality\n"
+    "3. Ensure paragraph structure is preserved\n"
+    "4. Ensure the English reads as natural prose, not a literal word-for-word translation\n\n"
+    "Output the result in this exact markdown format:\n"
+    "## Original (Bengali)\n\n"
+    "<corrected Bengali text>\n\n"
+    "---\n\n"
+    "## Translation (English)\n\n"
+    "<improved English translation>\n\n"
+    "Do NOT add any commentary, notes, or explanation.\n\n"
+    "--- BEGIN BENGALI ORIGINAL ---\n"
+    "{bn_text}\n"
+    "--- END BENGALI ORIGINAL ---\n\n"
+    "--- BEGIN ENGLISH TRANSLATION ---\n"
+    "{en_text}\n"
+    "--- END ENGLISH TRANSLATION ---"
+)
+
+
+def refine_translation_page(
+    bn_text: str,
+    en_text: str,
+    backend: str = DEFAULT_BACKEND,
+    model: str | None = None,
+    max_retries: int = 3,
+    # Backend-specific
+    opencode_cli: str | None = None,
+    attach_url: str | None = None,
+    gh_cli: str | None = None,
+) -> str:
+    """Send a Bengali+English pair for AI-based refinement. Returns refined markdown."""
+    prompt = _REFINEMENT_PROMPT.format(bn_text=bn_text, en_text=en_text)
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            t0 = time.time()
+            rc, stdout, stderr = _run_ai(
+                backend,
+                prompt,
+                model=model,
+                image_path=None,
+                timeout=300,
+                opencode_cli=opencode_cli,
+                attach_url=attach_url,
+                gh_cli=gh_cli,
+            )
+            elapsed = time.time() - t0
+
+            if rc == 0 and stdout:
+                refined = _clean_model_output(stdout)
+                log.debug(f"    Refinement OK in {elapsed:.1f}s ({len(refined)} chars)")
+                return refined
+            else:
+                log.warning(
+                    f"    Refinement attempt {attempt}/{max_retries} FAILED ({elapsed:.1f}s): "
+                    f"{stderr[:200] or 'empty output'}"
+                )
+        except subprocess.TimeoutExpired:
+            log.warning(f"    Refinement attempt {attempt}/{max_retries} TIMED OUT")
+        except FileNotFoundError as e:
+            log.error(f"CLI not found: {e}")
+            sys.exit(1)
+
+        if attempt < max_retries:
+            wait = attempt * 5
+            log.info(f"    Retrying in {wait}s...")
+            time.sleep(wait)
+
+    log.warning("    Refinement failed, keeping original translation")
+    return ""  # Empty signals "keep original"
+
+
+def refine_all_translations(
+    output_dir: str,
+    backend: str = DEFAULT_BACKEND,
+    model: str | None = None,
+    delay: float = 2,
+    max_retries: int = 3,
+    # Backend-specific
+    opencode_cli: str | None = None,
+    attach_url: str | None = None,
+    gh_cli: str | None = None,
+) -> list[Path]:
+    """Run AI-based refinement on all translated pages. Saves to refined/ directory.
+
+    Reads Bengali from ocr/ (or ocr_corrected/ if exists) and English from translations/.
+    Supports resume (skips pages with existing refined output).
+    Returns sorted list of refined file paths.
+    """
+    # Prefer corrected OCR if available
+    corrected_dir = Path(output_dir) / "ocr_corrected"
+    ocr_dir = corrected_dir if corrected_dir.exists() else Path(output_dir) / "ocr"
+    translations_dir = Path(output_dir) / "translations"
+    refined_dir = Path(output_dir) / "refined"
+    refined_dir.mkdir(parents=True, exist_ok=True)
+
+    if not translations_dir.exists():
+        log.error(f"Translations directory not found: {translations_dir}")
+        return []
+
+    md_files = sorted(translations_dir.glob("page_*.md"))
+    total = len(md_files)
+    generated: list[Path] = []
+    skipped = 0
+    phase_start = time.time()
+
+    log.info(f"Translation refinement pass: {total} pages (model: {model})")
+    log.info(f"  Bengali source: {ocr_dir}")
+
+    for i, md_path in enumerate(md_files, 1):
+        refined_path = refined_dir / md_path.name
+
+        # Resume support
+        if refined_path.exists() and refined_path.stat().st_size > 0:
+            skipped += 1
+            generated.append(refined_path)
+            elapsed = time.time() - phase_start
+            log.info(
+                _progress_bar(
+                    i, total, elapsed=elapsed, label=f"{md_path.name} SKIP (cached)"
+                )
+            )
+            continue
+
+        # Read the translation file
+        md_content = md_path.read_text(encoding="utf-8").strip()
+        if "No translatable text" in md_content:
+            refined_path.write_text(
+                "<!-- No translatable text on this page -->\n", encoding="utf-8"
+            )
+            generated.append(refined_path)
+            continue
+
+        # Read Bengali source
+        bn_path = ocr_dir / f"{md_path.stem}.txt"
+        if bn_path.exists():
+            bn_text = bn_path.read_text(encoding="utf-8").strip()
+        else:
+            # Extract from translation file
+            bn_paras, _ = _parse_translation_md(md_path)
+            bn_text = "\n\n".join(bn_paras)
+
+        # Extract English from translation file
+        _, en_paras = _parse_translation_md(md_path)
+        en_text = "\n\n".join(en_paras)
+
+        if not bn_text or not en_text:
+            refined_path.write_text(md_content + "\n", encoding="utf-8")
+            generated.append(refined_path)
+            continue
+
+        elapsed = time.time() - phase_start
+        log.info(
+            _progress_bar(
+                i - 1, total, elapsed=elapsed, label=f"{md_path.name} refining..."
+            )
+        )
+
+        refined = refine_translation_page(
+            bn_text,
+            en_text,
+            backend=backend,
+            model=model,
+            max_retries=max_retries,
+            opencode_cli=opencode_cli,
+            attach_url=attach_url,
+            gh_cli=gh_cli,
+        )
+
+        if refined:
+            refined_path.write_text(refined + "\n", encoding="utf-8")
+        else:
+            # Refinement failed, copy original
+            refined_path.write_text(md_content + "\n", encoding="utf-8")
+
+        generated.append(refined_path)
+
+        if i < total:
+            time.sleep(delay)
+
+    total_time = time.time() - phase_start
+    log.info(f"")
+    log.info(f"REFINEMENT COMPLETE: {total} pages in {_format_duration(total_time)}")
+    log.info(f"  Refined: {total - skipped} | Skipped: {skipped}")
+    log.info(f"  Output: {refined_dir}")
+    return sorted(generated)
+
+
+# ---------------------------------------------------------------------------
+# Refinement Step 4: Cross-page continuity stitching (FREE)
+# ---------------------------------------------------------------------------
+
+# Bengali sentence-ending punctuation: dari (।), question mark, exclamation
+_BN_SENTENCE_END = re.compile(r"[।?!।\?\!]\s*$")
+# Starts with a Bengali letter or common paragraph indicator
+_BN_PARA_START = re.compile(r"^[\u0980-\u09FF\"'\'\"\u201C\u201D—–-]")
+
+
+def stitch_pages(ocr_dir: str) -> tuple[int, list[str]]:
+    """Detect and fix sentence fragments split across page boundaries.
+
+    Examines the last line of page N and the first line of page N+1.
+    If the last line doesn't end with sentence-ending punctuation AND the
+    first line of the next page doesn't look like a new paragraph, merge them.
+
+    Modifies OCR files in place. Returns (count_of_stitches, list_of_descriptions).
+    """
+    ocr_path = Path(ocr_dir)
+    txt_files = sorted(ocr_path.glob("page_*.txt"))
+
+    if len(txt_files) < 2:
+        return 0, []
+
+    stitches: list[str] = []
+    count = 0
+
+    for i in range(len(txt_files) - 1):
+        curr_path = txt_files[i]
+        next_path = txt_files[i + 1]
+
+        curr_text = curr_path.read_text(encoding="utf-8").rstrip()
+        next_text = next_path.read_text(encoding="utf-8").lstrip()
+
+        if not curr_text or not next_text:
+            continue
+        if "NO_TEXT_CONTENT" in curr_text or "NO_TEXT_CONTENT" in next_text:
+            continue
+        if "OCR FAILED" in curr_text or "OCR FAILED" in next_text:
+            continue
+
+        # Get last non-empty line of current page
+        curr_lines = [l for l in curr_text.split("\n") if l.strip()]
+        next_lines = [l for l in next_text.split("\n") if l.strip()]
+
+        if not curr_lines or not next_lines:
+            continue
+
+        last_line = curr_lines[-1].strip()
+        first_line = next_lines[0].strip()
+
+        # Check: does last line end with sentence-ending punctuation?
+        ends_sentence = bool(_BN_SENTENCE_END.search(last_line))
+
+        # Check: does first line of next page look like a new paragraph?
+        # (starts with indentation, a dash/quote, or follows a blank line gap)
+        starts_new_para = (
+            next_text.startswith("\n")  # blank line at start
+            or next_text.startswith("  ")  # indented
+            or next_text.startswith("\t")  # tab indented
+        )
+
+        if not ends_sentence and not starts_new_para:
+            # Stitch: append first line of next page to end of current page
+            # and remove it from next page
+            count += 1
+            desc = (
+                f"Stitched {curr_path.name} -> {next_path.name}: "
+                f"...{last_line[-30:]} + {first_line[:30]}..."
+            )
+            stitches.append(desc)
+            log.info(f"  Stitch #{count}: {curr_path.name} <-> {next_path.name}")
+
+            # Merge: append first line of next to current
+            new_curr = curr_text + " " + first_line
+            curr_path.write_text(new_curr + "\n", encoding="utf-8")
+
+            # Remove first line from next page
+            remaining_lines = next_lines[1:]
+            new_next = "\n".join(remaining_lines) if remaining_lines else ""
+            next_path.write_text(new_next + "\n", encoding="utf-8")
+
+    log.info(f"Cross-page stitching: {count} fragments merged")
+    return count, stitches
+
+
+# ---------------------------------------------------------------------------
+# Refinement Step 5: Duplicate/overlap detection at page boundaries (FREE)
+# ---------------------------------------------------------------------------
+
+
+def detect_duplicates(
+    ocr_dir: str, similarity_threshold: float = 0.6, window: int = 150
+) -> list[dict]:
+    """Detect overlapping/duplicate content at page boundaries.
+
+    Compares the last `window` characters of page N with the first `window`
+    characters of page N+1 using SequenceMatcher. If similarity exceeds
+    threshold, flags it as a potential duplicate.
+
+    Returns a list of dicts: {page_a, page_b, similarity, overlap_a, overlap_b}
+    Does NOT modify files — only reports.
+    """
+    ocr_path = Path(ocr_dir)
+    txt_files = sorted(ocr_path.glob("page_*.txt"))
+
+    if len(txt_files) < 2:
+        return []
+
+    duplicates: list[dict] = []
+
+    for i in range(len(txt_files) - 1):
+        curr_path = txt_files[i]
+        next_path = txt_files[i + 1]
+
+        curr_text = curr_path.read_text(encoding="utf-8").strip()
+        next_text = next_path.read_text(encoding="utf-8").strip()
+
+        if not curr_text or not next_text:
+            continue
+
+        # Get tail of current and head of next
+        tail = curr_text[-window:]
+        head = next_text[:window]
+
+        # Compare using SequenceMatcher
+        ratio = difflib.SequenceMatcher(None, tail, head).ratio()
+
+        if ratio >= similarity_threshold:
+            duplicates.append(
+                {
+                    "page_a": curr_path.name,
+                    "page_b": next_path.name,
+                    "similarity": round(ratio, 3),
+                    "overlap_a_tail": tail[-80:],
+                    "overlap_b_head": head[:80],
+                }
+            )
+            log.warning(
+                f"  Potential overlap: {curr_path.name} <-> {next_path.name} "
+                f"(similarity: {ratio:.1%})"
+            )
+
+    log.info(
+        f"Duplicate detection: {len(duplicates)} potential overlaps found "
+        f"(threshold: {similarity_threshold:.0%})"
+    )
+    return duplicates
+
+
+# ---------------------------------------------------------------------------
+# Refinement Step 6: Quality scoring (FREE)
+# ---------------------------------------------------------------------------
+
+# Bengali Unicode range: U+0980 - U+09FF
+_BN_CHAR_RE = re.compile(r"[\u0980-\u09FF]")
+# Common English words that shouldn't appear in Bengali text
+_EN_WORD_RE = re.compile(r"\b[a-zA-Z]{3,}\b")
+
+
+def score_page_quality(page_name: str, bn_text: str, en_text: str) -> dict:
+    """Score the quality of a single Bengali/English page pair.
+
+    Metrics:
+    - length_ratio: ratio of Bengali chars to English chars (expected ~0.5-1.5)
+    - bn_non_bengali_pct: percentage of non-Bengali/non-whitespace chars in bn text
+    - en_untranslated_pct: percentage of Bengali chars remaining in English text
+    - bn_length: total Bengali text length
+    - en_length: total English text length
+    - is_short: whether the page has very little content (<50 chars)
+    - confidence: overall quality score 0-100
+
+    Returns a dict with all metrics.
+    """
+    bn_len = len(bn_text.strip())
+    en_len = len(en_text.strip())
+
+    # Bengali character counts
+    bn_bengali_chars = len(_BN_CHAR_RE.findall(bn_text))
+    bn_total_non_ws = len(re.sub(r"\s", "", bn_text))
+
+    # Non-Bengali percentage in Bengali text
+    bn_non_bengali_pct = 0.0
+    if bn_total_non_ws > 0:
+        bn_non_bengali = bn_total_non_ws - bn_bengali_chars
+        # Don't count Bengali punctuation (dari, etc) as non-Bengali
+        bn_punctuation = len(
+            re.findall(r"[।,;:\"\'—\-–\(\)\[\]\{\}!?\.\u0964\u0965]", bn_text)
+        )
+        bn_non_bengali = max(0, bn_non_bengali - bn_punctuation)
+        bn_non_bengali_pct = round(bn_non_bengali / bn_total_non_ws * 100, 1)
+
+    # Untranslated Bengali in English text
+    en_bengali_chars = len(_BN_CHAR_RE.findall(en_text))
+    en_total_chars = len(re.sub(r"\s", "", en_text))
+    en_untranslated_pct = 0.0
+    if en_total_chars > 0:
+        en_untranslated_pct = round(en_bengali_chars / en_total_chars * 100, 1)
+
+    # Length ratio
+    length_ratio = 0.0
+    if en_len > 0:
+        length_ratio = round(bn_len / en_len, 2)
+
+    # Is the page suspiciously short?
+    is_short = bn_len < 50 or en_len < 50
+
+    # Overall confidence score (0-100)
+    confidence = 100.0
+    penalties = []
+
+    # Penalty for extreme length ratios (expect 0.4-2.0)
+    if length_ratio < 0.2 or length_ratio > 3.0:
+        penalty = 30
+        confidence -= penalty
+        penalties.append(f"extreme_length_ratio({length_ratio})")
+    elif length_ratio < 0.4 or length_ratio > 2.0:
+        penalty = 15
+        confidence -= penalty
+        penalties.append(f"unusual_length_ratio({length_ratio})")
+
+    # Penalty for non-Bengali characters in Bengali text
+    if bn_non_bengali_pct > 30:
+        penalty = 25
+        confidence -= penalty
+        penalties.append(f"high_non_bengali({bn_non_bengali_pct}%)")
+    elif bn_non_bengali_pct > 15:
+        penalty = 10
+        confidence -= penalty
+        penalties.append(f"moderate_non_bengali({bn_non_bengali_pct}%)")
+
+    # Penalty for untranslated Bengali in English
+    if en_untranslated_pct > 20:
+        penalty = 30
+        confidence -= penalty
+        penalties.append(f"high_untranslated({en_untranslated_pct}%)")
+    elif en_untranslated_pct > 5:
+        penalty = 15
+        confidence -= penalty
+        penalties.append(f"some_untranslated({en_untranslated_pct}%)")
+
+    # Penalty for very short pages
+    if is_short:
+        penalty = 10
+        confidence -= penalty
+        penalties.append("very_short_page")
+
+    confidence = max(0, round(confidence, 1))
+
+    return {
+        "page": page_name,
+        "bn_length": bn_len,
+        "en_length": en_len,
+        "length_ratio": length_ratio,
+        "bn_non_bengali_pct": bn_non_bengali_pct,
+        "en_untranslated_pct": en_untranslated_pct,
+        "is_short": is_short,
+        "confidence": confidence,
+        "penalties": penalties,
+    }
+
+
+def score_all_pages(output_dir: str) -> dict:
+    """Score quality of all translated pages and generate quality_report.json.
+
+    Reads Bengali from ocr/ (or ocr_corrected/) and English from translations/ (or refined/).
+    Returns the full report dict and saves it to output_dir/quality_report.json.
+    """
+    # Prefer refined/corrected sources
+    refined_dir = Path(output_dir) / "refined"
+    translations_dir = (
+        refined_dir if refined_dir.exists() else Path(output_dir) / "translations"
+    )
+    corrected_dir = Path(output_dir) / "ocr_corrected"
+    ocr_dir = corrected_dir if corrected_dir.exists() else Path(output_dir) / "ocr"
+
+    if not translations_dir.exists():
+        log.error(f"No translations found in {output_dir}")
+        return {}
+
+    md_files = sorted(translations_dir.glob("page_*.md"))
+    page_scores: list[dict] = []
+    low_confidence_pages: list[str] = []
+
+    for md_path in md_files:
+        # Read Bengali
+        bn_path = ocr_dir / f"{md_path.stem}.txt"
+        if bn_path.exists():
+            bn_text = bn_path.read_text(encoding="utf-8").strip()
+        else:
+            bn_text = ""
+
+        # Read English from translation/refined md
+        _, en_paras = _parse_translation_md(md_path)
+        en_text = "\n\n".join(en_paras)
+
+        if not bn_text and not en_text:
+            continue
+
+        score = score_page_quality(md_path.name, bn_text, en_text)
+        page_scores.append(score)
+
+        if score["confidence"] < 60:
+            low_confidence_pages.append(score["page"])
+
+    # Summary statistics
+    if page_scores:
+        confidences = [s["confidence"] for s in page_scores]
+        avg_confidence = round(sum(confidences) / len(confidences), 1)
+        min_confidence = min(confidences)
+        max_confidence = max(confidences)
+        ratios = [s["length_ratio"] for s in page_scores if s["length_ratio"] > 0]
+        avg_ratio = round(sum(ratios) / len(ratios), 2) if ratios else 0
+    else:
+        avg_confidence = 0
+        min_confidence = 0
+        max_confidence = 0
+        avg_ratio = 0
+
+    report = {
+        "generated_at": datetime.now().isoformat(),
+        "total_pages": len(page_scores),
+        "summary": {
+            "avg_confidence": avg_confidence,
+            "min_confidence": min_confidence,
+            "max_confidence": max_confidence,
+            "avg_length_ratio": avg_ratio,
+            "low_confidence_count": len(low_confidence_pages),
+            "low_confidence_pages": low_confidence_pages,
+        },
+        "pages": page_scores,
+    }
+
+    report_path = Path(output_dir) / "quality_report.json"
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+
+    log.info(f"Quality report saved to {report_path}")
+    log.info(
+        f"  Pages scored: {len(page_scores)} | "
+        f"Avg confidence: {avg_confidence} | "
+        f"Low confidence (<60): {len(low_confidence_pages)}"
+    )
+    if low_confidence_pages:
+        log.warning(f"  Low confidence pages: {', '.join(low_confidence_pages)}")
+
+    return report
 
 
 def combine_translations(
@@ -1280,6 +2079,9 @@ Examples:
   # Full pipeline with two-pass (OCR + translate) — default uses gh-copilot + Claude
   python pdf_to_book.py run book.pdf
 
+  # Full pipeline with AI refinement (OCR correction + translation review)
+  python pdf_to_book.py run book.pdf --refine
+
   # Use config file
   python pdf_to_book.py run book.pdf -c config.json
 
@@ -1300,6 +2102,9 @@ Examples:
 
   # Only translate already-OCR'd text
   python pdf_to_book.py translate -o output/moyurakkhi/
+
+  # Run AI refinement on existing output (standalone)
+  python pdf_to_book.py refine -o output/moyurakkhi/
 
   # Combine translations into one file
   python pdf_to_book.py combine -o output/moyurakkhi/ --title "My Book" --author "Author"
@@ -1445,6 +2250,17 @@ Examples:
         help="Mark translation as human-reviewed (default: False)",
     )
     _add_common_args(run_parser)
+    run_parser.add_argument(
+        "--refine",
+        action="store_true",
+        default=False,
+        help="Enable AI refinement passes (OCR correction + translation review). Costs extra API calls.",
+    )
+    run_parser.add_argument(
+        "--refine-model",
+        default=None,
+        help="Model for AI refinement passes (default: same as translate model)",
+    )
 
     # --- extract: PDF to images only ---
     extract_parser = subparsers.add_parser(
@@ -1514,6 +2330,36 @@ Examples:
         default=False,
         help="Enable verbose/debug logging",
     )
+
+    # --- refine: standalone AI refinement ---
+    refine_parser = subparsers.add_parser(
+        "refine",
+        help="Run AI refinement on existing OCR + translations (OCR correction + translation review)",
+    )
+    refine_parser.add_argument(
+        "--output",
+        "-o",
+        default="output",
+        help="Output directory (must contain ocr/ and translations/)",
+    )
+    refine_parser.add_argument(
+        "--refine-model",
+        default=None,
+        help="Model for AI refinement (default: claude-sonnet-4.6)",
+    )
+    refine_parser.add_argument(
+        "--skip-ocr-correction",
+        action="store_true",
+        default=False,
+        help="Skip the OCR correction step (only refine translations)",
+    )
+    refine_parser.add_argument(
+        "--skip-translation-review",
+        action="store_true",
+        default=False,
+        help="Skip the translation review step (only correct OCR)",
+    )
+    _add_common_args(refine_parser)
 
     # --- export-json: export to bangla-library format ---
     export_parser = subparsers.add_parser(
@@ -1640,18 +2486,33 @@ Examples:
         delay = args.delay if args.delay != 2 else config.get("delay_between_pages", 2)
         max_retries = config.get("max_retries", 3)
         single_pass = args.single_pass
+        do_refine = args.refine
 
         # Model resolution — default to Claude Sonnet 4.6 for both
         ocr_model = args.ocr_model or config.get("ocr_model") or "claude-sonnet-4.6"
         translate_model = (
             args.translate_model or config.get("translate_model") or "claude-sonnet-4.6"
         )
+        refine_model = args.refine_model or translate_model
         if args.model:
             if single_pass:
                 ocr_model = args.model
             else:
                 ocr_model = args.model
                 translate_model = args.model
+
+        # Calculate total steps for step labels
+        if single_pass:
+            total_steps = 3  # extract, translate, combine
+        else:
+            # Base: extract(1) + OCR(2) + translate(3) + combine
+            # Free refinement steps always run: normalize(+1), stitch(+1), dedup(+1), quality(+1)
+            # AI refinement steps run only with --refine: OCR correction(+1), translation review(+1)
+            total_steps = 4 + 4  # 8 base (4 core + 4 free refinement)
+            if do_refine:
+                total_steps += 2  # +2 for AI refinement
+            # combine is the last step before bonus
+            # so: extract, OCR, normalize, stitch, dedup, [ocr_correction], translate, [translation_review], quality, combine
 
         pipeline_start = time.time()
         log.info("=" * 60)
@@ -1665,14 +2526,21 @@ Examples:
             log.info(f"  Mode:       two-pass (OCR + Translate)")
             log.info(f"  OCR model:  {ocr_model}")
             log.info(f"  Trans model:{translate_model}")
+            if do_refine:
+                log.info(f"  Refine:     ON (model: {refine_model})")
+            else:
+                log.info(f"  Refine:     OFF (use --refine to enable AI refinement)")
         log.info(f"  Languages:  {source_lang} -> {target_lang}")
         log.info(f"  Output:     {output_dir}")
         log.info(f"  Started:    {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         log.info("=" * 60)
 
+        step_num = 0
+
         # Step 1: Extract
+        step_num += 1
         log.info("")
-        log.info(">>> STEP 1/4: Extracting pages from PDF")
+        log.info(f">>> STEP {step_num}/{total_steps}: Extracting pages from PDF")
         log.info("-" * 40)
         extract_start = time.time()
         images = pdf_to_images(
@@ -1690,8 +2558,11 @@ Examples:
 
         if single_pass:
             # Single-pass: send image directly for OCR + translation
+            step_num += 1
             log.info("")
-            log.info(">>> STEP 2/3: Translating pages (single-pass)")
+            log.info(
+                f">>> STEP {step_num}/{total_steps}: Translating pages (single-pass)"
+            )
             log.info("-" * 40)
             prompt = build_prompt(source_lang, target_lang)
             translations_dir = Path(output_dir) / "translations"
@@ -1750,9 +2621,14 @@ Examples:
                 if i < total:
                     time.sleep(delay)
         else:
-            # Two-pass: OCR then translate
+            # Two-pass: OCR then translate, with refinement steps interspersed
+
+            # Step: OCR
+            step_num += 1
             log.info("")
-            log.info(">>> STEP 2/4: OCR -- extracting text from images")
+            log.info(
+                f">>> STEP {step_num}/{total_steps}: OCR -- extracting text from images"
+            )
             log.info("-" * 40)
             ocr_files = ocr_all_pages(
                 images,
@@ -1766,9 +2642,69 @@ Examples:
                 gh_cli=ctx["gh_cli"],
             )
 
+            # Step: Unicode normalization (FREE — always runs)
+            step_num += 1
             log.info("")
-            log.info(">>> STEP 3/4: Translating extracted text")
+            log.info(f">>> STEP {step_num}/{total_steps}: Unicode text normalization")
             log.info("-" * 40)
+            norm_count = normalize_ocr_files(output_dir)
+            log.info(f"Normalization done ({norm_count} files modified)")
+
+            # Step: Cross-page stitching (FREE — always runs)
+            step_num += 1
+            log.info("")
+            log.info(
+                f">>> STEP {step_num}/{total_steps}: Cross-page continuity stitching"
+            )
+            log.info("-" * 40)
+            ocr_dir_path = str(Path(output_dir) / "ocr")
+            stitch_count, stitch_details = stitch_pages(ocr_dir_path)
+            log.info(f"Stitching done ({stitch_count} fragments merged)")
+
+            # Step: Duplicate detection (FREE — always runs)
+            step_num += 1
+            log.info("")
+            log.info(f">>> STEP {step_num}/{total_steps}: Duplicate/overlap detection")
+            log.info("-" * 40)
+            duplicates = detect_duplicates(ocr_dir_path)
+            if duplicates:
+                log.warning(
+                    f"Found {len(duplicates)} potential overlaps — review quality_report.json"
+                )
+            else:
+                log.info("No duplicates detected")
+
+            # Step: AI-based OCR correction (only with --refine)
+            if do_refine:
+                step_num += 1
+                log.info("")
+                log.info(
+                    f">>> STEP {step_num}/{total_steps}: AI-based OCR error correction"
+                )
+                log.info("-" * 40)
+                correct_ocr_all_pages(
+                    output_dir,
+                    backend=ctx["backend"],
+                    model=refine_model,
+                    delay=delay,
+                    max_retries=max_retries,
+                    opencode_cli=ctx["opencode_cli"],
+                    attach_url=ctx["attach_url"],
+                    gh_cli=ctx["gh_cli"],
+                )
+
+            # Step: Translate
+            step_num += 1
+            log.info("")
+            log.info(f">>> STEP {step_num}/{total_steps}: Translating extracted text")
+            log.info("-" * 40)
+
+            # If OCR correction was done, translate from corrected files
+            if do_refine:
+                corrected_dir = Path(output_dir) / "ocr_corrected"
+                if corrected_dir.exists():
+                    ocr_files = sorted(corrected_dir.glob("page_*.txt"))
+
             translation_paths = translate_all_pages(
                 ocr_files,
                 output_dir,
@@ -1783,10 +2719,45 @@ Examples:
                 gh_cli=ctx["gh_cli"],
             )
 
+            # Step: AI-based translation refinement (only with --refine)
+            if do_refine:
+                step_num += 1
+                log.info("")
+                log.info(
+                    f">>> STEP {step_num}/{total_steps}: AI-based translation refinement"
+                )
+                log.info("-" * 40)
+                refined_paths = refine_all_translations(
+                    output_dir,
+                    backend=ctx["backend"],
+                    model=refine_model,
+                    delay=delay,
+                    max_retries=max_retries,
+                    opencode_cli=ctx["opencode_cli"],
+                    attach_url=ctx["attach_url"],
+                    gh_cli=ctx["gh_cli"],
+                )
+                # Use refined translations for combine step if available
+                if refined_paths:
+                    translation_paths = refined_paths
+
+            # Step: Quality scoring (FREE — always runs)
+            step_num += 1
+            log.info("")
+            log.info(f">>> STEP {step_num}/{total_steps}: Quality scoring")
+            log.info("-" * 40)
+            quality_report = score_all_pages(output_dir)
+            # Include duplicate info in quality report
+            if duplicates and quality_report:
+                quality_report["duplicates"] = duplicates
+                report_path = Path(output_dir) / "quality_report.json"
+                with open(report_path, "w", encoding="utf-8") as f:
+                    json.dump(quality_report, f, ensure_ascii=False, indent=2)
+
         # Final step: Combine
-        step_label = "3/3" if single_pass else "4/4"
+        step_num += 1
         log.info("")
-        log.info(f">>> STEP {step_label}: Combining into book")
+        log.info(f">>> STEP {step_num}/{total_steps}: Combining into book")
         log.info("-" * 40)
         book_path = combine_translations(
             translation_paths,
@@ -1948,6 +2919,116 @@ Examples:
             sys.exit(1)
 
         combine_translations(md_files, args.output, args.title, args.author)
+
+    # ---- REFINE ONLY ----
+    elif args.command == "refine":
+        log = setup_logging(args.output, verbose=args.verbose)
+        ctx = _resolve_backend(args)
+
+        output_dir = args.output
+        refine_model = args.refine_model or "claude-sonnet-4.6"
+
+        ocr_dir = Path(output_dir) / "ocr"
+        translations_dir = Path(output_dir) / "translations"
+
+        if not ocr_dir.exists():
+            log.error(f"OCR directory not found: {ocr_dir}")
+            log.error("Run 'ocr' first, or check your --output path.")
+            sys.exit(1)
+        if not translations_dir.exists():
+            log.error(f"Translations directory not found: {translations_dir}")
+            log.error("Run 'translate' first, or check your --output path.")
+            sys.exit(1)
+
+        refine_start = time.time()
+        log.info("=" * 60)
+        log.info(f"  AI Refinement Pipeline")
+        log.info(f"  Backend:    {ctx['backend']}")
+        log.info(f"  Model:      {refine_model}")
+        log.info(f"  Output:     {output_dir}")
+        log.info("=" * 60)
+
+        step = 0
+        skip_ocr = args.skip_ocr_correction
+        skip_trans = args.skip_translation_review
+        total_steps = 4  # normalize + stitch + dedup + quality (always)
+        if not skip_ocr:
+            total_steps += 1
+        if not skip_trans:
+            total_steps += 1
+
+        # 1. Unicode normalization
+        step += 1
+        log.info("")
+        log.info(f">>> STEP {step}/{total_steps}: Unicode text normalization")
+        log.info("-" * 40)
+        normalize_ocr_files(output_dir)
+
+        # 2. Cross-page stitching
+        step += 1
+        log.info("")
+        log.info(f">>> STEP {step}/{total_steps}: Cross-page continuity stitching")
+        log.info("-" * 40)
+        stitch_pages(str(ocr_dir))
+
+        # 3. Duplicate detection
+        step += 1
+        log.info("")
+        log.info(f">>> STEP {step}/{total_steps}: Duplicate/overlap detection")
+        log.info("-" * 40)
+        duplicates = detect_duplicates(str(ocr_dir))
+
+        # 4. AI OCR correction (optional)
+        if not skip_ocr:
+            step += 1
+            log.info("")
+            log.info(f">>> STEP {step}/{total_steps}: AI-based OCR error correction")
+            log.info("-" * 40)
+            correct_ocr_all_pages(
+                output_dir,
+                backend=ctx["backend"],
+                model=refine_model,
+                delay=args.delay,
+                opencode_cli=ctx["opencode_cli"],
+                attach_url=ctx["attach_url"],
+                gh_cli=ctx["gh_cli"],
+            )
+
+        # 5. AI translation refinement (optional)
+        if not skip_trans:
+            step += 1
+            log.info("")
+            log.info(f">>> STEP {step}/{total_steps}: AI-based translation refinement")
+            log.info("-" * 40)
+            refine_all_translations(
+                output_dir,
+                backend=ctx["backend"],
+                model=refine_model,
+                delay=args.delay,
+                opencode_cli=ctx["opencode_cli"],
+                attach_url=ctx["attach_url"],
+                gh_cli=ctx["gh_cli"],
+            )
+
+        # 6. Quality scoring
+        step += 1
+        log.info("")
+        log.info(f">>> STEP {step}/{total_steps}: Quality scoring")
+        log.info("-" * 40)
+        quality_report = score_all_pages(output_dir)
+        if duplicates and quality_report:
+            quality_report["duplicates"] = duplicates
+            report_path = Path(output_dir) / "quality_report.json"
+            with open(report_path, "w", encoding="utf-8") as f:
+                json.dump(quality_report, f, ensure_ascii=False, indent=2)
+
+        total_time = time.time() - refine_start
+        log.info("")
+        log.info("=" * 60)
+        log.info(f"  REFINEMENT COMPLETE")
+        log.info(f"  Duration: {_format_duration(total_time)}")
+        log.info(f"  Report:   {Path(output_dir) / 'quality_report.json'}")
+        log.info("=" * 60)
 
     # ---- EXPORT JSON ----
     elif args.command == "export-json":
