@@ -287,6 +287,9 @@ def pdf_to_images(
 ) -> list[Path]:
     """Convert each page of a PDF into an image file.
 
+    Also extracts embedded text (if present) and saves to embedded_text/ dir.
+    This allows the OCR step to skip AI calls for pages with existing text.
+
     Returns a sorted list of paths to the generated images.
     """
     try:
@@ -298,6 +301,10 @@ def pdf_to_images(
     images_dir = Path(output_dir) / "pages"
     images_dir.mkdir(parents=True, exist_ok=True)
 
+    # Also create dir for embedded text extraction
+    embedded_dir = Path(output_dir) / "embedded_text"
+    embedded_dir.mkdir(parents=True, exist_ok=True)
+
     doc = fitz.open(pdf_path)
     total_pages = len(doc)
     end = end_page if end_page else total_pages
@@ -306,6 +313,7 @@ def pdf_to_images(
     log.info(f"PDF has {total_pages} pages. Processing pages {start_page}-{end}.")
 
     generated: list[Path] = []
+    pages_with_text = 0
     zoom = dpi / 72  # 72 is the default PDF DPI
     matrix = fitz.Matrix(zoom, zoom)
 
@@ -321,10 +329,28 @@ def pdf_to_images(
         image_path = images_dir / f"page_{page_display:04d}.{fmt}"
         pix.save(str(image_path))
         generated.append(image_path)
-        log.info(f"  Extracted page {page_display}/{end}")
+
+        # Extract embedded text if available
+        embedded_text = str(page.get_text("text")).strip()
+        txt_path = embedded_dir / f"page_{page_display:04d}.txt"
+        if embedded_text:
+            txt_path.write_text(embedded_text + "\n", encoding="utf-8")
+            pages_with_text += 1
+            log.info(
+                f"  Extracted page {page_display}/{end} (has embedded text: {len(embedded_text)} chars)"
+            )
+        else:
+            # Write empty file to signal "no embedded text"
+            txt_path.write_text("", encoding="utf-8")
+            log.info(f"  Extracted page {page_display}/{end} (image only)")
 
     doc.close()
     log.info(f"Extracted {len(generated)} page images to {images_dir}")
+    if pages_with_text > 0:
+        log.info(
+            f"  {pages_with_text}/{len(generated)} pages have embedded text "
+            f"(will skip AI OCR for these)"
+        )
     return sorted(generated)
 
 
@@ -464,6 +490,36 @@ def _run_ai(
 # Pass 1: OCR — extract Bengali text from page images
 # ---------------------------------------------------------------------------
 
+# Bengali Unicode range for detection
+_BN_CHAR_DETECT = re.compile(r"[\u0980-\u09FF]")
+
+# Minimum number of Bengali characters to consider embedded text usable
+_MIN_EMBEDDED_BN_CHARS = 30
+
+
+def _has_usable_embedded_text(output_dir: str, page_stem: str) -> str | None:
+    """Check if a page has usable embedded text from PDF extraction.
+
+    Returns the embedded text if it contains enough Bengali characters
+    to be considered a real text page (not just stray characters from
+    headers/page numbers). Returns None otherwise.
+    """
+    embedded_path = Path(output_dir) / "embedded_text" / f"{page_stem}.txt"
+    if not embedded_path.exists():
+        return None
+
+    text = embedded_path.read_text(encoding="utf-8").strip()
+    if not text:
+        return None
+
+    # Count Bengali characters
+    bn_chars = len(_BN_CHAR_DETECT.findall(text))
+    if bn_chars >= _MIN_EMBEDDED_BN_CHARS:
+        return text
+
+    return None
+
+
 _OCR_PROMPT = (
     "You are an expert OCR engine for Bengali (Bangla) script. "
     "Extract ALL the Bengali text from this image exactly as written. "
@@ -539,6 +595,9 @@ def ocr_all_pages(
 ) -> list[Path]:
     """OCR all page images and save extracted text as .txt files.
 
+    Uses embedded PDF text when available (instant, free), falling back
+    to AI-based OCR only for scanned/image-only pages.
+
     Returns a sorted list of paths to the generated text files.
     Supports resuming (skips pages with existing OCR output).
     """
@@ -549,6 +608,7 @@ def ocr_all_pages(
     generated: list[Path] = []
     skipped = 0
     failed = 0
+    embedded_used = 0
     phase_start = time.time()
 
     log.info(f"OCR pass: {total} pages to process (model: {ocr_model})")
@@ -568,6 +628,25 @@ def ocr_all_pages(
             )
             continue
 
+        # Check for usable embedded text (from PDF text layer)
+        embedded = _has_usable_embedded_text(output_dir, img_path.stem)
+        if embedded:
+            embedded_used += 1
+            chars = len(embedded)
+            txt_path.write_text(embedded + "\n", encoding="utf-8")
+            generated.append(txt_path)
+            elapsed = time.time() - phase_start
+            log.info(
+                _progress_bar(
+                    i,
+                    total,
+                    elapsed=elapsed,
+                    label=f"{img_path.name} EMBEDDED ({chars} chars, no AI call)",
+                )
+            )
+            continue
+
+        # No embedded text — use AI OCR
         elapsed = time.time() - phase_start
         log.info(
             _progress_bar(
@@ -604,7 +683,8 @@ def ocr_all_pages(
     log.info(f"")
     log.info(f"OCR COMPLETE: {total} pages in {_format_duration(total_time)}")
     log.info(
-        f"  Processed: {total - skipped - failed} | Skipped: {skipped} | Failed: {failed}"
+        f"  AI OCR: {total - skipped - failed - embedded_used} | "
+        f"Embedded text: {embedded_used} | Skipped: {skipped} | Failed: {failed}"
     )
     log.info(f"  Output: {ocr_dir}")
     return sorted(generated)
