@@ -2042,7 +2042,78 @@ def export_to_json(
     log.info(
         f"  Bengali: {len(all_bn)} | English: {len(all_en)} | Paired: {paired_count}"
     )
+
+    # Auto-create author stub if author info is available
+    if author_en:
+        _auto_create_author_json(
+            output_dir=output_dir,
+            author_en=author_en,
+            author_bn=author_bn,
+            author_slug=author_slug,
+            category=category,
+        )
+
     return json_path
+
+
+def _auto_create_author_json(
+    output_dir: str,
+    author_en: str,
+    author_bn: str = "",
+    author_slug: str = "",
+    category: str = "",
+) -> Path | None:
+    """Auto-create an author JSON stub in an ``authors/`` sibling directory.
+
+    The author file is placed next to the book JSON so the user can copy both
+    into the bangla-library content collections.  If the file already exists
+    it is **not** overwritten — only new stubs are created.
+
+    Returns the path to the author file, or None if it already existed.
+    """
+    if not author_slug:
+        author_slug = author_en.lower().replace(" ", "-")
+        author_slug = re.sub(r"[^a-z0-9-]", "", author_slug)
+        author_slug = re.sub(r"-+", "-", author_slug).strip("-")
+
+    authors_dir = Path(output_dir) / "authors"
+    authors_dir.mkdir(parents=True, exist_ok=True)
+    author_path = authors_dir / f"{author_slug}.json"
+
+    if author_path.exists():
+        log.info(f"  Author already exists: {author_path}")
+        return None
+
+    # Map book category to likely author genres
+    genre_map: dict[str, list[str]] = {
+        "Novel": ["Novel", "Fiction"],
+        "Poetry": ["Poetry"],
+        "Short Story": ["Short Story", "Fiction"],
+        "Detective Fiction": ["Detective Fiction", "Thriller"],
+        "Science Fiction": ["Science Fiction", "Fiction"],
+        "Drama": ["Drama", "Theatre"],
+        "Essay": ["Essay", "Non-fiction"],
+        "Memoir": ["Memoir", "Non-fiction"],
+    }
+    genres = genre_map.get(category, [category] if category else [])
+
+    author_data: dict = {
+        "name_bn": author_bn or "",
+        "name_en": author_en,
+        "nationality": "Bangladeshi",
+        "genres": genres,
+        "awards": [],
+        "bio_en": "",
+        "bio_bn": "",
+        "facts": [],
+    }
+
+    with open(author_path, "w", encoding="utf-8") as f:
+        json.dump(author_data, f, ensure_ascii=False, indent=2)
+
+    log.info(f"  Auto-created author stub: {author_path}")
+    log.info(f"  → Edit to add bio, facts, image_url, wikipedia_en, etc.")
+    return author_path
 
 
 # ---------------------------------------------------------------------------

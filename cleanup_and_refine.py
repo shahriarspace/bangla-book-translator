@@ -489,6 +489,33 @@ def main():
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
+    # Auto-create author stub
+    author_slug = output.get("author_slug", "")
+    author_en = output.get("author_en", "")
+    author_bn = output.get("author_bn", "")
+    if author_en and author_slug:
+        out_dir = os.path.dirname(os.path.abspath(args.output)) or "."
+        authors_dir = os.path.join(out_dir, "authors")
+        os.makedirs(authors_dir, exist_ok=True)
+        author_path = os.path.join(authors_dir, f"{author_slug}.json")
+        if not os.path.exists(author_path):
+            author_data = {
+                "name_bn": author_bn,
+                "name_en": author_en,
+                "nationality": "Bangladeshi",
+                "genres": ["Detective Fiction", "Thriller"],
+                "awards": [],
+                "bio_en": "",
+                "bio_bn": "",
+                "facts": [],
+            }
+            with open(author_path, "w", encoding="utf-8") as f:
+                json.dump(author_data, f, ensure_ascii=False, indent=2)
+            log(f"  Auto-created author stub: {author_path}")
+            log(f"  -> Edit to add bio, facts, image_url, etc.")
+        else:
+            log(f"  Author already exists: {author_path}")
+
     log(f"Done! Output: {args.output}")
     log(f"  Paragraphs: {len(final_paragraphs)}")
 
