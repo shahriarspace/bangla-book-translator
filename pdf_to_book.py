@@ -1821,6 +1821,36 @@ date: "{time.strftime("%Y-%m-%d")}"
 # ---------------------------------------------------------------------------
 
 
+def _merge_paragraphs_to_count(paragraphs: list[str], target_count: int) -> list[str]:
+    """Merge a list of paragraphs (lines) into `target_count` groups.
+
+    Distributes paragraphs as evenly as possible across groups,
+    joining adjacent paragraphs with newlines. This is used when OCR
+    produces raw lines without paragraph breaks but the translator
+    grouped them into proper paragraphs.
+    """
+    if target_count <= 0 or not paragraphs:
+        return paragraphs
+    if len(paragraphs) <= target_count:
+        return paragraphs
+
+    # Distribute N items into target_count groups as evenly as possible
+    n = len(paragraphs)
+    base_size = n // target_count
+    remainder = n % target_count
+
+    merged = []
+    idx = 0
+    for i in range(target_count):
+        # First 'remainder' groups get one extra item
+        group_size = base_size + (1 if i < remainder else 0)
+        group = paragraphs[idx : idx + group_size]
+        merged.append("\n".join(group))
+        idx += group_size
+
+    return merged
+
+
 def _parse_translation_md(md_path: Path) -> tuple[list[str], list[str]]:
     """Parse a translation .md file into Bengali and English paragraph lists.
 
@@ -1883,6 +1913,19 @@ def _parse_translation_md(md_path: Path) -> tuple[list[str], list[str]]:
         and len(bn_paragraphs) < len(en_paragraphs) * 0.5
     ):
         bn_paragraphs = [p.strip() for p in bn_section.split("\n") if p.strip()]
+
+    # After splitting, if one side has MORE paragraphs than the other,
+    # merge the longer side's paragraphs to match the shorter side's count.
+    # This prevents unpaired "(translation not available)" or placeholder paragraphs.
+    if bn_paragraphs and en_paragraphs:
+        if len(bn_paragraphs) > len(en_paragraphs):
+            bn_paragraphs = _merge_paragraphs_to_count(
+                bn_paragraphs, len(en_paragraphs)
+            )
+        elif len(en_paragraphs) > len(bn_paragraphs):
+            en_paragraphs = _merge_paragraphs_to_count(
+                en_paragraphs, len(bn_paragraphs)
+            )
 
     return bn_paragraphs, en_paragraphs
 
